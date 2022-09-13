@@ -1,120 +1,106 @@
 import typing
 
-import apple_data
 import unicorn
-import os.path
-import pathlib
-import hashlib
+import machine_state
+import image_loader
 
-
-class MachineState:
-    def __init__(self):
-        self.msr_data = apple_data.load_file("registers")
-
-    def friendly_name(self, cp_reg: unicorn.unicorn.uc_arm64_cp_reg) -> str:
-        msr_map = self.msr_data["aarch64"]["msr"]
-        apple_map = self.msr_data["aarch64"]["apple_system_registers"]
-        reg_descriptor = (
-            f"S{cp_reg.op0}_{cp_reg.op1}_c{cp_reg.crn}_c{cp_reg.crm}_{cp_reg.op2}"
-        )
-        if reg_descriptor in msr_map:
-            return msr_map[reg_descriptor]
-        if reg_descriptor in apple_map:
-            return apple_map[reg_descriptor]
-
-        return "Unknown"
+RegisterHook = typing.Callable[[int], int]
 
 
 class SecureEMU:
-    _core: dict[str, typing.Any]
+    _core: image_loader.Core
+    register_bank = {}
+    register_hooks: dict[str, RegisterHook]
 
     def __init__(self, core: int):
-        self._core = SecureEMU._cores['chip_ids'][core]
-        self._machine_state = MachineState()
+        self._core = image_loader.ImageLoader.get_core(core)
+        self._machine_state = machine_state.MachineState()
 
-    def get_securerom(path: str) -> bytes:
-        rom_path = pathlib.Path(os.path.dirname(__file__)).joinpath(path)
-        with open(rom_path, mode="rb") as file:
-            return file.read()
+    @staticmethod
+    def cp_reg_to_id(cp_reg: unicorn.unicorn.uc_arm64_cp_reg) -> str:
+        return f"c{cp_reg.crn}_c{cp_reg.crm}_{cp_reg.op1}_{cp_reg.op2}"
+
+    @staticmethod
+    def _hook_block(uc, address, size, user_data):
+        print(">>> Tracing basic block at 0x%x, block size = 0x%x" % (address, size))
+
+    @staticmethod
+    def _hook_code(uc, address, size, user_data):
+        print(
+            ">>> Tracing instruction at 0x%x, instruction size = 0x%x" % (address, size)
+        )
+
+    @staticmethod
+    def _hook_mrs(uc: unicorn.Uc, reg, cp_reg, reg_file) -> bool:
+        pc = uc.reg_read(unicorn.arm64_const.UC_ARM64_REG_PC)
+        reg_friendly = msr_util.friendly_name(cp_reg)
+        print(
+            f">>> Hook MRS read instruction ({pc:x}): reg = 0x{reg:x}(UC_ARM64_REG_X2) cp_reg = {cp_reg}\n>>>\t{reg_friendly}"
+        )
+        reg_id = _cp_reg_to_id(cp_reg)
+        if reg_id not in reg_file:
+            reg_file[reg_id] = 0
+
+        uc.reg_write(reg, reg_file[reg_id])
+        uc.reg_write(unicorn.arm64_const.UC_ARM64_REG_PC, pc + 4)
+        # Skip MRS instruction
+
+        return True
+
+    def _hook_msr(self, uc: unicorn.Uc, reg, cp_reg, reg_file) -> bool:
+        pc = uc.reg_read(unicorn.arm64_const.UC_ARM64_REG_PC)
+        reg_friendly = msr_util.friendly_name(cp_reg)
+        print(
+            f">>> Hook MSR store instruction ({pc:x}): reg = 0x{reg:x}(UC_ARM64_REG_X2) cp_reg = {cp_reg}\n>>>\t{reg_friendly}"
+        )
+        reg_id = SecureEMU._cp_reg_to_id(cp_reg)
+        reg_value = uc.reg_read(reg)
+        if reg_id in self.register_hooks:
+            value_to_store = self.register_hooks[reg_id](reg_value)
+            reg_file[reg_id] = value_to_store
+        else:
+            reg_file[reg_id] = reg_value
+        uc.reg_write(unicorn.arm64_const.UC_ARM64_REG_PC, pc + 4)
+        # Skip MRS instruction
+
+        return True
+
+    @staticmethod
+    def _hook_mem_invalid(mu: unicorn.Uc, access, address, size, value, user_data):
+        ip = mu.reg_read(unicorn.arm64_const.UC_ARM64_REG_PC)
+        match access:
+            case unicorn.UC_MEM_FETCH:
+                access_type = "FETCH"
+            case unicorn.UC_MEM_READ:
+                access_type = "READ"
+            case unicorn.UC_MEM_WRITE:
+                access_type = "WRITE"
+            case other:
+                access_type = f"UNKNOWN <{access:x}>"
+
+        error = f">>> {access_type} ACCESS at 0x{address:016x} from IP = 0x{ip:016x}, data size = {size}, data value = 0x{value:x}"
+        print(error)
 
     def run(self):
-
         mu = unicorn.Uc(unicorn.UC_ARCH_ARM64, unicorn.UC_MODE_ARM)
-        mu.mem_map(T8015_ROM_BASE, len(rom), unicorn.UC_PROT_EXEC | unicorn.UC_PROT_READ)
+        mu.mem_map(self._core.image_base, self._core.image_size, unicorn.UC_PROT_EXEC | unicorn.UC_PROT_READ)
 
-        mu.mem_write(T8015_ROM_BASE, rom)
+        mu.mem_write(self._core.image_base, self._core.secure_rom)
 
-        mu.mem_map(T8015_SRAM_BASE, T8015_SRAM_SIZE, unicorn.UC_PROT_ALL)
-        register_bank = {}
-        register_hooks = {}
+        mu.mem_map(self._core.sram_base, self._core.sram_size, unicorn.UC_PROT_ALL)
 
-        def c15_c7_3_0(value) -> int:
+        def cache_as_ram_helper(value) -> int:
             if value & 0x01:
                 return 0x8000000000000000 | value
             else:
                 return value
 
-        register_hooks["c15_c7_3_0"] = c15_c7_3_0
+        self.register_hooks["c15_c7_3_0"] = cache_as_ram_helper
 
-        def cp_reg_to_id(cp_reg):
-            return f"c{cp_reg.crn}_c{cp_reg.crm}_{cp_reg.op1}_{cp_reg.op2}"
 
-        def hook_mrs(uc: unicorn.Uc, reg, cp_reg, reg_file) -> bool:
-            pc = uc.reg_read(unicorn.arm64_const.UC_ARM64_REG_PC)
-            reg_friendly = msr_util.friendly_name(cp_reg)
-            print(
-                f">>> Hook MRS read instruction ({pc:x}): reg = 0x{reg:x}(UC_ARM64_REG_X2) cp_reg = {cp_reg}\n>>>\t{reg_friendly}"
-            )
-            reg_id = cp_reg_to_id(cp_reg)
-            if reg_id not in reg_file:
-                reg_file[reg_id] = 0
 
-            uc.reg_write(reg, reg_file[reg_id])
-            uc.reg_write(unicorn.arm64_const.UC_ARM64_REG_PC, pc + 4)
-            # Skip MRS instruction
 
-            return True
 
-        def hook_msr(uc: unicorn.Uc, reg, cp_reg, reg_file) -> bool:
-            pc = uc.reg_read(unicorn.arm64_const.UC_ARM64_REG_PC)
-            reg_friendly = msr_util.friendly_name(cp_reg)
-            print(
-                f">>> Hook MSR store instruction ({pc:x}): reg = 0x{reg:x}(UC_ARM64_REG_X2) cp_reg = {cp_reg}\n>>>\t{reg_friendly}"
-            )
-            reg_id = cp_reg_to_id(cp_reg)
-            reg_value = uc.reg_read(reg)
-            if reg_id in register_hooks:
-                value_to_store = register_hooks[reg_id](reg_value)
-                reg_file[reg_id] = value_to_store
-            else:
-                reg_file[reg_id] = reg_value
-            uc.reg_write(unicorn.arm64_const.UC_ARM64_REG_PC, pc + 4)
-            # Skip MRS instruction
-
-            return True
-
-        def hook_block(uc, address, size, user_data):
-            print(">>> Tracing basic block at 0x%x, block size = 0x%x" % (address, size))
-
-        def hook_code(uc, address, size, user_data):
-            print(
-                ">>> Tracing instruction at 0x%x, instruction size = 0x%x" % (address, size)
-            )
-
-        def hook_mem_invalid(mu: unicorn.Uc, access, address, size, value, user_data):
-            ip = mu.reg_read(unicorn.arm64_const.UC_ARM64_REG_PC)
-            match access:
-                case unicorn.UC_MEM_FETCH:
-                    access_type = "FETCH"
-                case unicorn.UC_MEM_READ:
-                    access_type = "READ"
-                case unicorn.UC_MEM_WRITE:
-                    access_type = "WRITE"
-                case other:
-                    access_type = f"UNKNOWN <{access:x}>"
-
-            error = f">>> {access_type} ACCESS at 0x{address:016x} from IP = 0x{ip:016x}, data size = {size}, data value = 0x{value:x}"
-            print(error)
 
         # mu.hook_add(unicorn.UC_HOOK_BLOCK, hook_block)
         mu.hook_add(unicorn.UC_HOOK_MEM_FETCH_UNMAPPED, hook_mem_invalid)
@@ -124,7 +110,7 @@ class SecureEMU:
         mu.hook_add(
             unicorn.UC_HOOK_INSN,
             hook_mrs,
-            register_bank,
+            self.register_bank,
             1,
             0,
             unicorn.arm64_const.UC_ARM64_INS_MRS,
@@ -132,7 +118,7 @@ class SecureEMU:
         mu.hook_add(
             unicorn.UC_HOOK_INSN,
             hook_msr,
-            register_bank,
+            self.register_bank,
             1,
             0,
             unicorn.arm64_const.UC_ARM64_INS_MSR,
@@ -143,13 +129,6 @@ class SecureEMU:
         except unicorn.UcError as e:
             print(e)
 
-    ROMS: dict[str, pathlib.Path] = {}
-    _cores: dict[str, typing.Any] = {}
 
 
-for image_path in pathlib.Path(os.path.join(os.path.dirname(__file__), '../ext/roms/resources/APROM')).glob("*"):
-    with open(image_path, 'rb') as f:
-        data = f.read()
-        SecureEMU.ROMS[hashlib.sha256(data).hexdigest()] = image_path
 
-SecureEMU._cores = apple_data.load_file('cores')
